@@ -25,6 +25,9 @@ import (
 
 var debug = true // only change if testing or if you like console logs for whatever reason
 
+// Global stream override: nil = per-request, true = always stream, false = never stream
+var streamOverride *bool
+
 // HTTP client (shared) just makes requests faster
 var sharedHTTPClient = &http.Client{
 	Timeout: 60 * time.Second,
@@ -57,17 +60,55 @@ type chatResp struct {
 
 // ollamaResp is the response format for ollama
 type ollamaResp struct {
-	Model     string `json:"model"`
-	CreatedAt string `json:"created_at"`
-	Message   msg    `json:"message"`
-	Done      bool   `json:"done"`
+	Model              string `json:"model"`
+	CreatedAt          string `json:"created_at"`
+	Message            msg    `json:"message"`
+	DoneReason         string `json:"done_reason,omitempty"`
+	Done               bool   `json:"done"`
+	TotalDuration      int64  `json:"total_duration,omitempty"`
+	LoadDuration       int64  `json:"load_duration,omitempty"`
+	PromptEvalCount    int    `json:"prompt_eval_count,omitempty"`
+	PromptEvalDuration int64  `json:"prompt_eval_duration,omitempty"`
+	EvalCount          int    `json:"eval_count,omitempty"`
+	EvalDuration       int64  `json:"eval_duration,omitempty"`
 }
 
 // main function (starts the server)
 func main() {
+	var input string
+	inputCh := make(chan string, 1)
+	go func() {
+		fmt.Print("Force streaming? (on/off/ask): ")
+		fmt.Scanln(&input)
+		inputCh <- input
+	}()
+	select {
+	case input = <-inputCh:
+		input = strings.ToLower(strings.TrimSpace(input))
+		if input == "on" {
+			b := true
+			streamOverride = &b
+			fmt.Println("Streaming will always be ON for this session")
+		} else if input == "off" {
+			b := false
+			streamOverride = &b
+			fmt.Println("Streaming will always be OFF for this session")
+		} else {
+			streamOverride = nil
+			fmt.Println("Streaming will be decided per request of the service")
+		}
+	case <-time.After(10 * time.Second):
+		streamOverride = nil
+		fmt.Println("\nno input in 10s defaulting to ask (basically the service decides) mode.")
+	}
 	http.HandleFunc("/api/chat", hChat)
-	// import _ "net/http/pprof" at the top to enable
-	// _ = http.ListenAndServe("localhost:6060", nil) // Uncomment to enable pprof on a separate port
+	http.HandleFunc("/api/generate", hChat)
+	http.HandleFunc("/api/tags", hTags)
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("Ollama is running")) //spoofs the fact that ollama is running cuz some services relay on it
+	})
 	prt := ":11434"
 	fmt.Printf("starting server on http://127.0.0.1%s\n", prt)
 	fmt.Println("please make sure to close ollama before continuing")
@@ -75,8 +116,18 @@ func main() {
 	log.Fatal(http.ListenAndServe(prt, nil))
 }
 
-// handler for requests to /api/chat :D
+// handler for requests to /api/chat and /api/generate :D
 func hChat(w http.ResponseWriter, r *http.Request) {
+	// allows all cors cuz some apps require them
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -188,7 +239,8 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 				Role:    "assistant",
 				Content: "Too many requests please wait a min... (contact atticus if you think higher request limits should be set)",
 			},
-			Done: true,
+			DoneReason: "stop",
+			Done:       true,
 		}
 		respBytes, _ := json.Marshal(ollamaErrResp)
 		w.Write(respBytes)
@@ -219,40 +271,89 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 			}
 			reply = uhhchatresp.Reply
 		}
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		flusher, ok := w.(http.Flusher)
-		if !ok {
-			http.Error(w, "unsupported stream...", http.StatusInternalServerError)
-			return
+		// global override to prevent service from changing it
+		stream := req.Stream
+		if streamOverride != nil {
+			stream = *streamOverride
 		}
-		words := SplitW(reply)
-		uuhhnoideahowtocallthislol := 100 //i recommend not to touch if number too big/small could hunder performance
-		for i := 0; i < len(words); i += uuhhnoideahowtocallthislol {
-			end := i + uuhhnoideahowtocallthislol
-			if end > len(words) {
-				end = len(words)
+		if stream {
+			w.Header().Set("Content-Type", "application/x-ndjson")
+			w.WriteHeader(http.StatusOK)
+			// Remove all U+000A (Line Feed) characters from reply
+			reply = strings.ReplaceAll(reply, "\n", "")
+			cleaned := make([]rune, 0, len(reply))
+			for _, r := range reply {
+				if r == 0x20 || (r >= 0x21 && r <= 0x7E) {
+					cleaned = append(cleaned, r)
+				}
 			}
-			var builder strings.Builder
-			for _, w := range words[i:end] {
-				builder.WriteString(w)
+			reply = string(cleaned)
+			flusher, ok := w.(http.Flusher)
+			if !ok {
+				http.Error(w, "unsupported stream...", http.StatusInternalServerError)
+				return
 			}
-			content := builder.String()
-			done := end == len(words)
-			uhhobjofollamaResp := ollamaResp{
-				Model:     model,
-				CreatedAt: createdAt,
-				Message: msg{
-					Role:    "assistant",
-					Content: content,
-				},
-				Done: done,
+			words := strings.Fields(reply)
+			pos := 0
+			for _, word := range words {
+				start := strings.Index(reply[pos:], word)
+				if start == -1 {
+					continue
+				}
+				start += pos
+				chunk := word
+				if start > 0 && reply[start-1] == ' ' {
+					chunk = " " + word
+				}
+				pos = start + len(word)
+				uhhobjofollamaResp := ollamaResp{
+					Model:     model,
+					CreatedAt: createdAt,
+					Message: msg{
+						Role:    "assistant",
+						Content: chunk,
+					},
+					Done: false,
+				}
+				respBytes, _ := json.Marshal(uhhobjofollamaResp)
+				w.Write(respBytes)
+				w.Write([]byte("\n"))
+				flusher.Flush()
 			}
-			respBytes, _ := json.Marshal(uhhobjofollamaResp)
+			// spoofs final metadata that is present in ollama WHY idk but some services need it so...
+			finalResp := ollamaResp{
+				Model:              model,
+				CreatedAt:          createdAt,
+				Message:            msg{Role: "assistant", Content: ""},
+				DoneReason:         "stop",
+				Done:               true,
+				TotalDuration:      4768114600, // Example values, replace with real timing if needed
+				LoadDuration:       2497832600,
+				PromptEvalCount:    84,
+				PromptEvalDuration: 491959200,
+				EvalCount:          37,
+				EvalDuration:       1746310500,
+			}
+			respBytes, _ := json.Marshal(finalResp)
 			w.Write(respBytes)
 			w.Write([]byte("\n"))
 			flusher.Flush()
+			return
 		}
+		// sends a single json respsone incase of nonstream mode
+		uhhobjofollamaResp := ollamaResp{
+			Model:     model,
+			CreatedAt: createdAt,
+			Message: msg{
+				Role:    "assistant",
+				Content: reply,
+			},
+			DoneReason: "stop",
+			Done:       true,
+		}
+		respBytes, _ := json.Marshal(uhhobjofollamaResp)
+		w.Write(respBytes)
+		w.Write([]byte("\n"))
 		return
 	}
 	if model == "dall-e-3" {
@@ -286,7 +387,8 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 				Role:    "assistant",
 				Content: imageURL,
 			},
-			Done: true,
+			DoneReason: "stop",
+			Done:       true,
 		}
 		respBytes, _ := json.Marshal(uhhobjofollamaResp)
 		w.Write(respBytes)
@@ -321,7 +423,8 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 				Role:    "assistant",
 				Content: base64str,
 			},
-			Done: true,
+			DoneReason: "stop",
+			Done:       true,
 		}
 		respBytes, _ := json.Marshal(uhhobjofollamaResp)
 		w.Write(respBytes)
@@ -351,7 +454,8 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 				Role:    "assistant",
 				Content: ttsResp.URL,
 			},
-			Done: true,
+			DoneReason: "stop",
+			Done:       true,
 		}
 		respBytes, _ := json.Marshal(uhhobjofollamaResp)
 		w.Write(respBytes)
@@ -359,9 +463,154 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Type", "application/x-ndjson")
 	w.WriteHeader(http.StatusOK)
 	w.Write(body)
+}
+
+// spoofs which models are available allowing services to see all your options.
+func hTags(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{
+	"models": [
+		{
+			"name": "gpt-4o",
+			"model": "gpt-4o",
+			"modified_at": "2069-01-01T00:00:00Z",
+			"size": 69,
+			"digest": "yesiputfunnynumberabove",
+			"details": {
+				"parent_model": "fuck you",
+				"format": "openai",
+				"family": "gpt-4o",
+				"families": ["gpt-4o"],
+				"parameter_size": "yes",
+				"quantization_level": "i"
+			}
+		},
+		{
+			"name": "gpt-4o-mini",
+			"model": "gpt-4o-mini",
+			"modified_at": "2069-01-01T00:00:00Z",
+			"size": 69,
+			"digest": "yesiputfunnynumberabove",
+			"details": {
+				"parent_model": "don't",
+				"format": "openai",
+				"family": "gpt-4o-mini",
+				"families": ["gpt-4o-mini"],
+				"parameter_size": "know",
+				"quantization_level": "what"
+			}
+		},
+		{
+			"name": "gpt-4.1-nano",
+			"model": "gpt-4.1-nano",
+			"modified_at": "2069-01-01T00:00:00Z",
+			"size": 69,
+			"digest": "yesiputfunnynumberabove",
+			"details": {
+				"parent_model": "to",
+				"format": "openai",
+				"family": "gpt-4.1-nano",
+				"families": ["gpt-4.1-nano"],
+				"parameter_size": "put",
+				"quantization_level": "here"
+			}
+		},
+		{
+			"name": "gpt-4.1-mini",
+			"model": "gpt-4.1-mini",
+			"modified_at": "2069-01-01T00:00:00Z",
+			"size": 69,
+			"digest": "yesiputfunnynumberabove",
+			"details": {
+				"parent_model": "so",
+				"format": "fuck",
+				"family": "gpt-4.1-mini",
+				"families": ["gpt-4.1-mini"],
+				"parameter_size": "off",
+				"quantization_level": ":)" 
+			}
+		},
+		{
+			"name": "gpt-4.1",
+			"model": "gpt-4.1",
+			"modified_at": "2069-01-01T00:00:00Z",
+			"size": 69,
+			"digest": "yesiputfunnynumberabove",
+			"details": {
+				"parent_model": "too",
+				"format": "openai",
+				"family": "gpt-4.1",
+				"families": ["gpt-4.1"],
+				"parameter_size": "many",
+				"quantization_level": "models"
+			}
+		},
+		{
+			"name": "gpt-3.5",
+			"model": "gpt-3.5",
+			"modified_at": "2069-01-01T00:00:00Z",
+			"size": 69,
+			"digest": "yesiputfunnynumberabove",
+			"details": {
+				"parent_model": "i",
+				"format": "openai",
+				"family": "gpt-3.5",
+				"families": ["gpt-3.5"],
+				"parameter_size": "s",
+				"quantization_level": "t"
+			}
+		},
+		{
+			"name": "tts",
+			"model": "tts",
+			"modified_at": "2069-01-01T00:00:00Z",
+			"size": 69,
+			"digest": "yesiputfunnynumberabove",
+			"details": {
+				"parent_model": "g",
+				"format": "openai",
+				"family": "tts",
+				"families": ["tts"],
+				"parameter_size": "x",
+				"quantization_level": "d"
+			}
+		},
+		{
+			"name": "base64",
+			"model": "base64",
+			"modified_at": "2069-01-01T00:00:00Z",
+			"size": 69,
+			"digest": "yesiputfunnynumberabove",
+			"details": {
+				"parent_model": "does",
+				"format": "openai (not really just have nothing to put here)",
+				"family": "base64",
+				"families": ["base64"],
+				"parameter_size": "it",
+				"quantization_level": "ever"
+			}
+		},
+		{
+			"name": "dall-e-3",
+			"model": "dall-e-3",
+			"modified_at": "2069-01-01T00:00:00Z",
+			"size": 69,
+			"digest": "yesiputfunnynumberabove",
+			"details": {
+				"parent_model": "stop",
+				"format": "openai",
+				"family": "dall-e-3",
+				"families": ["dall-e-3"],
+				"parameter_size": "finally",
+				"quantization_level": "!!!"
+			}
+		}
+	]
+}`))
 }
 
 // split words (just so the responses are the same as ollama)
