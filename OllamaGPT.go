@@ -28,6 +28,9 @@ var debug = true // only change if testing or if you like console logs for whate
 // Global stream override: nil = per-request, true = always stream, false = never stream
 var streamOverride *bool
 
+// Global dementia mode override: nil = ask user, true = always enable, false = always disable (just don't touch if u don't know what you're doing)
+var dementiaOverride *bool
+
 // HTTP client (shared) just makes requests faster
 var sharedHTTPClient = &http.Client{
 	Timeout: 60 * time.Second,
@@ -145,6 +148,35 @@ func main() {
 		streamOverride = nil
 		fmt.Println("\nno input in 10s defaulting to ask (basically the service decides) mode.")
 	}
+	if dementiaOverride == nil {
+		dementiaCh := make(chan string, 1)
+		go func() {
+			fmt.Print("Press 'p' to enable dementia mode (basically if you're using a service that is a chatbot enable this): ")
+			var dementiaInput string
+			fmt.Scanln(&dementiaInput)
+			dementiaCh <- dementiaInput
+		}()
+		select {
+		case dementiaInput := <-dementiaCh:
+			if strings.ToLower(strings.TrimSpace(dementiaInput)) == "p" {
+				b := true
+				dementiaOverride = &b
+				fmt.Println("dementia mode enabled long messages will be automatically trimmed")
+			} else {
+				b := false
+				dementiaOverride = &b
+				fmt.Println("dementia mode disabled")
+			}
+		case <-time.After(3 * time.Second):
+			b := false
+			dementiaOverride = &b
+			fmt.Println("\nno input in 3s dementia mode disabled")
+		}
+	} else if *dementiaOverride {
+		fmt.Println("dementia mode forced ON long messages will be trimmed")
+	} else {
+		fmt.Println("dementia mode forced OFF")
+	}
 
 	// Pre-warm the connection in the background
 	go preWarmConnection()
@@ -227,13 +259,102 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	model := req.Model
+	baseModel := model
+	if strings.HasSuffix(model, ":latest") {
+		baseModel = strings.TrimSuffix(model, ":latest")
+	}
 	var endpoint string
 	var reqBody []byte
 	contentType := "application/json"
 	isChatStream := false
 	isV2 := false
-	switch model {
+	switch baseModel {
 	case "gpt-4o", "gpt-4o-mini", "gpt-4.1-nano", "gpt-4.1-mini", "gpt-4.1":
+		// detects and blocks any request to do unnecessary api intensive tasks such as suggesting next question/chat name you can disable if u want i recommend not to (causes alot of unnecessary issues with ratelimits)
+		for _, m := range req.Messages {
+			if strings.Contains(m.Content, "### Task:") {
+				if debug {
+					fmt.Printf("[DEBUG] Blocked request (unnecessary api spam)\n")
+				}
+				w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+
+				var respBytes []byte
+				if isGenerateRequest {
+					ollamaErrResp := ollamaGenerateResp{
+						Model:      model,
+						CreatedAt:  nowRFC(),
+						Response:   "Request blocked due to unnecessary api spam  (trying to predict next messages/chatname)",
+						DoneReason: "stop",
+						Done:       true,
+					}
+					respBytes, _ = json.Marshal(ollamaErrResp)
+				} else {
+					ollamaErrResp := ollamaResp{
+						Model:     model,
+						CreatedAt: nowRFC(),
+						Message: msg{
+							Role:    "assistant",
+							Content: "Request blocked due to unnecessary api spam (trying to predict next messages/chatname)",
+						},
+						DoneReason: "stop",
+						Done:       true,
+					}
+					respBytes, _ = json.Marshal(ollamaErrResp)
+				}
+				w.Write(respBytes)
+				w.Write([]byte("\n"))
+				return
+			}
+		}
+
+		totalLength := 0
+		for _, m := range req.Messages {
+			totalLength += len(m.Content)
+		}
+
+		if totalLength > 8000 {
+			if dementiaOverride != nil && *dementiaOverride {
+				if debug {
+					fmt.Printf("[DEBUG] GPT prompt too long (%d chars) using dementia mode to trim it down\n", totalLength)
+				}
+				req.Messages = circumsizeM(req.Messages, 8000)
+			} else {
+				if debug {
+					fmt.Printf("[DEBUG] GPT prompt too long (%d chars) blocking request (use dementia mode if u want the messages to just be trimmed down)\n", totalLength)
+				}
+				w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+
+				var respBytes []byte
+				if isGenerateRequest {
+					ollamaErrResp := ollamaGenerateResp{
+						Model:      model,
+						CreatedAt:  nowRFC(),
+						Response:   "prompt too long please keep it under 8000 characters (or simply enable dementia mode next time on runtime)",
+						DoneReason: "stop",
+						Done:       true,
+					}
+					respBytes, _ = json.Marshal(ollamaErrResp)
+				} else {
+					ollamaErrResp := ollamaResp{
+						Model:     model,
+						CreatedAt: nowRFC(),
+						Message: msg{
+							Role:    "assistant",
+							Content: "prompt too long please keep it under 8000 characters (or simply enable dementia mode next time on runtime)",
+						},
+						DoneReason: "stop",
+						Done:       true,
+					}
+					respBytes, _ = json.Marshal(ollamaErrResp)
+				}
+				w.Write(respBytes)
+				w.Write([]byte("\n"))
+				return
+			}
+		}
+
 		endpoint = "https://pfuner.xyz/v2/chat/completions"
 		temp := 0.7
 		if opts, ok := req.Options.(map[string]interface{}); ok {
@@ -249,7 +370,7 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 			})
 		}
 		uhhobjofchatReq := map[string]interface{}{
-			"model":       model,
+			"model":       baseModel,
 			"messages":    openaiMsgs,
 			"temperature": temp,
 		}
@@ -265,8 +386,77 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		if len(req.Messages) > 0 {
 			prompt = req.Messages[len(req.Messages)-1].Content
 		}
+		if strings.Contains(prompt, "### Task:") {
+			if debug {
+				fmt.Printf("[DEBUG] Blocked unnecessary api spam\n")
+			}
+			w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+
+			var respBytes []byte
+			if isGenerateRequest {
+				ollamaErrResp := ollamaGenerateResp{
+					Model:      model,
+					CreatedAt:  nowRFC(),
+					Response:   "Request blocked due to unnecessary api spam",
+					DoneReason: "stop",
+					Done:       true,
+				}
+				respBytes, _ = json.Marshal(ollamaErrResp)
+			} else {
+				ollamaErrResp := ollamaResp{
+					Model:     model,
+					CreatedAt: nowRFC(),
+					Message: msg{
+						Role:    "assistant",
+						Content: "Request blocked due to unnessary api spam",
+					},
+					DoneReason: "stop",
+					Done:       true,
+				}
+				respBytes, _ = json.Marshal(ollamaErrResp)
+			}
+			w.Write(respBytes)
+			w.Write([]byte("\n"))
+			return
+		}
+		if len(prompt) > 1000 {
+			if debug {
+				fmt.Printf("[DEBUG] DALL-E prompt too long (%d chars) blocking request\n", len(prompt))
+			}
+			w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+
+			var respBytes []byte
+			if isGenerateRequest {
+				ollamaErrResp := ollamaGenerateResp{
+					Model:      model,
+					CreatedAt:  nowRFC(),
+					Response:   "please keep the text under 1000 characters (btw using image generation in chat mode is not smart)",
+					DoneReason: "stop",
+					Done:       true,
+				}
+				respBytes, _ = json.Marshal(ollamaErrResp)
+			} else {
+				ollamaErrResp := ollamaResp{
+					Model:     model,
+					CreatedAt: nowRFC(),
+					Message: msg{
+						Role:    "assistant",
+						Content: "please keep the text under 1000 characters (btw using image generation in chat mode is not smart)",
+					},
+					DoneReason: "stop",
+					Done:       true,
+				}
+				respBytes, _ = json.Marshal(ollamaErrResp)
+			}
+			w.Write(respBytes)
+			w.Write([]byte("\n"))
+			return
+		}
+
 		imgReq := map[string]interface{}{
-			"model":  "dall-e-3",
+			"model":  baseModel,
 			"prompt": prompt,
 			"size":   "1024x1024",
 			"n":      1,
@@ -281,6 +471,76 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		if len(req.Messages) > 0 {
 			prompt = req.Messages[len(req.Messages)-1].Content
 		}
+
+		if strings.Contains(prompt, "### Task:") {
+			if debug {
+				fmt.Printf("[DEBUG] Blocked unnecessary api spam\n")
+			}
+			w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+
+			var respBytes []byte
+			if isGenerateRequest {
+				ollamaErrResp := ollamaGenerateResp{
+					Model:      model,
+					CreatedAt:  nowRFC(),
+					Response:   "Request blocked due to unnecessary api spam",
+					DoneReason: "stop",
+					Done:       true,
+				}
+				respBytes, _ = json.Marshal(ollamaErrResp)
+			} else {
+				ollamaErrResp := ollamaResp{
+					Model:     model,
+					CreatedAt: nowRFC(),
+					Message: msg{
+						Role:    "assistant",
+						Content: "Request blocked due to unnessary api spam",
+					},
+					DoneReason: "stop",
+					Done:       true,
+				}
+				respBytes, _ = json.Marshal(ollamaErrResp)
+			}
+			w.Write(respBytes)
+			w.Write([]byte("\n"))
+			return
+		}
+		if len(prompt) > 1000 {
+			if debug {
+				fmt.Printf("[DEBUG] Base64 prompt too long (%d chars) blocking request\n", len(prompt))
+			}
+			w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+
+			var respBytes []byte
+			if isGenerateRequest {
+				ollamaErrResp := ollamaGenerateResp{
+					Model:      model,
+					CreatedAt:  nowRFC(),
+					Response:   "please keep the text under 1000 characters (btw using image generation in chat mode is not smart)",
+					DoneReason: "stop",
+					Done:       true,
+				}
+				respBytes, _ = json.Marshal(ollamaErrResp)
+			} else {
+				ollamaErrResp := ollamaResp{
+					Model:     model,
+					CreatedAt: nowRFC(),
+					Message: msg{
+						Role:    "assistant",
+						Content: "please keep the text under 1000 characters (btw using image generation in chat mode is not smart)",
+					},
+					DoneReason: "stop",
+					Done:       true,
+				}
+				respBytes, _ = json.Marshal(ollamaErrResp)
+			}
+			w.Write(respBytes)
+			w.Write([]byte("\n"))
+			return
+		}
+
 		imgReq := map[string]interface{}{
 			"prompt": prompt,
 		}
@@ -291,11 +551,170 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		if len(req.Messages) > 0 {
 			text = req.Messages[len(req.Messages)-1].Content
 		}
+
+		if strings.Contains(text, "### Task:") {
+			if debug {
+				fmt.Printf("[DEBUG] Blocked unnecessary api spam\n")
+			}
+			w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+
+			var respBytes []byte
+			if isGenerateRequest {
+				ollamaErrResp := ollamaGenerateResp{
+					Model:      model,
+					CreatedAt:  nowRFC(),
+					Response:   "Request blocked due to unnecessary api spam",
+					DoneReason: "stop",
+					Done:       true,
+				}
+				respBytes, _ = json.Marshal(ollamaErrResp)
+			} else {
+				ollamaErrResp := ollamaResp{
+					Model:     model,
+					CreatedAt: nowRFC(),
+					Message: msg{
+						Role:    "assistant",
+						Content: "Request blocked due to unnessary api spam",
+					},
+					DoneReason: "stop",
+					Done:       true,
+				}
+				respBytes, _ = json.Marshal(ollamaErrResp)
+			}
+			w.Write(respBytes)
+			w.Write([]byte("\n"))
+			return
+		}
+		if len(text) > 500 {
+			if debug {
+				fmt.Printf("[DEBUG] TTS text too long (%d chars) blocking request\n", len(text))
+			}
+			w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+
+			var respBytes []byte
+			if isGenerateRequest {
+				ollamaErrResp := ollamaGenerateResp{
+					Model:      model,
+					CreatedAt:  nowRFC(),
+					Response:   "please keep the text under 500 characters (btw using tts in chat is not smart)",
+					DoneReason: "stop",
+					Done:       true,
+				}
+				respBytes, _ = json.Marshal(ollamaErrResp)
+			} else {
+				ollamaErrResp := ollamaResp{
+					Model:     model,
+					CreatedAt: nowRFC(),
+					Message: msg{
+						Role:    "assistant",
+						Content: "please keep the text under 500 characters (btw using tts in chat is not smart)",
+					},
+					DoneReason: "stop",
+					Done:       true,
+				}
+				respBytes, _ = json.Marshal(ollamaErrResp)
+			}
+			w.Write(respBytes)
+			w.Write([]byte("\n"))
+			return
+		}
+
 		ttsReq := map[string]interface{}{
 			"text": text,
 		}
 		reqBody, _ = json.Marshal(ttsReq)
 	default:
+		if debug {
+			fmt.Printf("[DEBUG] Model '%s' not matched, falling back to v1 endpoint\n", baseModel)
+		}
+
+		// detects and blocks any request to do unnecessary api intensive tasks such as suggesting next question/chat name you can disable if u want i recommend not to (causes alot of unnecessary issues with ratelimits)
+		for _, m := range req.Messages {
+			if strings.Contains(m.Content, "### Task:") {
+				if debug {
+					fmt.Printf("[DEBUG] Blocked request (unnecessary api spam)\n")
+				}
+				w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+
+				var respBytes []byte
+				if isGenerateRequest {
+					ollamaErrResp := ollamaGenerateResp{
+						Model:      model,
+						CreatedAt:  nowRFC(),
+						Response:   "Request blocked due to unnecessary api spam (trying to predict next messages/chatname)",
+						DoneReason: "stop",
+						Done:       true,
+					}
+					respBytes, _ = json.Marshal(ollamaErrResp)
+				} else {
+					ollamaErrResp := ollamaResp{
+						Model:     model,
+						CreatedAt: nowRFC(),
+						Message: msg{
+							Role:    "assistant",
+							Content: "Request blocked due to unnecessary api spam (trying to predict next messages/chatname)",
+						},
+						DoneReason: "stop",
+						Done:       true,
+					}
+					respBytes, _ = json.Marshal(ollamaErrResp)
+				}
+				w.Write(respBytes)
+				w.Write([]byte("\n"))
+				return
+			}
+		}
+
+		totalLength := 0
+		for _, m := range req.Messages {
+			totalLength += len(m.Content)
+		}
+
+		if totalLength > 2000 {
+			if dementiaOverride != nil && *dementiaOverride {
+				if debug {
+					fmt.Printf("[DEBUG] Default model prompt too long (%d chars) using dementia mode to trim it down\n", totalLength)
+				}
+				req.Messages = circumsizeM(req.Messages, 2000)
+			} else {
+				if debug {
+					fmt.Printf("[DEBUG] Default model prompt too long (%d chars) blocking request (use dementia mode if u want the messages to just be trimmed down)\n", totalLength)
+				}
+				w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+				w.WriteHeader(http.StatusOK)
+
+				var respBytes []byte
+				if isGenerateRequest {
+					ollamaErrResp := ollamaGenerateResp{
+						Model:      model,
+						CreatedAt:  nowRFC(),
+						Response:   "prompt too long please keep it under 2000 characters (or simply enable dementia mode next time on runtime)",
+						DoneReason: "stop",
+						Done:       true,
+					}
+					respBytes, _ = json.Marshal(ollamaErrResp)
+				} else {
+					ollamaErrResp := ollamaResp{
+						Model:     model,
+						CreatedAt: nowRFC(),
+						Message: msg{
+							Role:    "assistant",
+							Content: "prompt too long please keep it under 2000 characters (or simply enable dementia mode next time on runtime)",
+						},
+						DoneReason: "stop",
+						Done:       true,
+					}
+					respBytes, _ = json.Marshal(ollamaErrResp)
+				}
+				w.Write(respBytes)
+				w.Write([]byte("\n"))
+				return
+			}
+		}
+
 		endpoint = "https://pfuner.xyz/v1/chat/completions"
 		var messages []string
 		for _, m := range req.Messages {
@@ -304,8 +723,12 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		chatReq := chatReq{
 			Messages: messages,
 		}
+		fmt.Printf("[DEBUG] Sending message", messages)
 		reqBody, _ = json.Marshal(chatReq)
 		isChatStream = true
+	}
+	if debug {
+		fmt.Printf("[DEBUG] Sending request to %s\n", endpoint)
 	}
 	resp, err := sharedHTTPClient.Post(endpoint, contentType, bytes.NewBuffer(reqBody))
 	if err != nil {
@@ -318,6 +741,43 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "[ERROR] reading response...", http.StatusInternalServerError)
 		return
 	}
+
+	// Check if response is HTML (likely blocked by Cloudflare or other protection)
+	if strings.HasPrefix(string(body), `{"reply":"<!DOCTYPE html>\`) || strings.HasPrefix(string(body), "<html>") {
+		if debug {
+			fmt.Printf("[DEBUG] HTML response detected, likely blocked by Cloudflare\n")
+		}
+		w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+
+		var respBytes []byte
+		if isGenerateRequest {
+			ollamaErrResp := ollamaGenerateResp{
+				Model:      model,
+				CreatedAt:  nowRFC(),
+				Response:   "Response was blocked please try again in a minute...",
+				DoneReason: "stop",
+				Done:       true,
+			}
+			respBytes, _ = json.Marshal(ollamaErrResp)
+		} else {
+			ollamaErrResp := ollamaResp{
+				Model:     model,
+				CreatedAt: nowRFC(),
+				Message: msg{
+					Role:    "assistant",
+					Content: "Response was blocked please try again in a minute...",
+				},
+				DoneReason: "stop",
+				Done:       true,
+			}
+			respBytes, _ = json.Marshal(ollamaErrResp)
+		}
+		w.Write(respBytes)
+		w.Write([]byte("\n"))
+		return
+	}
+
 	//added support for x-ndjson + fixed some problems with the /api/generate ratelimit errors
 	if resp.StatusCode == 429 || strings.Contains(string(body), "\"Too many requests (\"") {
 		w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
@@ -674,11 +1134,12 @@ func hTags(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`{
+	//changed everything to add :latest since doesn't work without it 🫠
+	w.Write([]byte(`{ 
 	"models": [
 		{
-			"name": "gpt-4o",
-			"model": "gpt-4o",
+			"name": "gpt-4o:latest",
+			"model": "gpt-4o:latest",
 			"modified_at": "2069-01-01T00:00:00Z",
 			"size": 69,
 			"digest": "yesiputfunnynumberabove",
@@ -692,8 +1153,8 @@ func hTags(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 		{
-			"name": "gpt-4o-mini",
-			"model": "gpt-4o-mini",
+			"name": "gpt-4o-mini:latest",
+			"model": "gpt-4o-mini:latest",
 			"modified_at": "2069-01-01T00:00:00Z",
 			"size": 69,
 			"digest": "yesiputfunnynumberabove",
@@ -707,8 +1168,8 @@ func hTags(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 		{
-			"name": "gpt-4.1-nano",
-			"model": "gpt-4.1-nano",
+			"name": "gpt-4.1-nano:latest",
+			"model": "gpt-4.1-nano:latest",
 			"modified_at": "2069-01-01T00:00:00Z",
 			"size": 69,
 			"digest": "yesiputfunnynumberabove",
@@ -722,8 +1183,8 @@ func hTags(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 		{
-			"name": "gpt-4.1-mini",
-			"model": "gpt-4.1-mini",
+			"name": "gpt-4.1-mini:latest",
+			"model": "gpt-4.1-mini:latest",
 			"modified_at": "2069-01-01T00:00:00Z",
 			"size": 69,
 			"digest": "yesiputfunnynumberabove",
@@ -737,8 +1198,8 @@ func hTags(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 		{
-			"name": "gpt-4.1",
-			"model": "gpt-4.1",
+			"name": "gpt-4.1:latest",
+			"model": "gpt-4.1:latest",
 			"modified_at": "2069-01-01T00:00:00Z",
 			"size": 69,
 			"digest": "yesiputfunnynumberabove",
@@ -752,8 +1213,8 @@ func hTags(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 		{
-			"name": "gpt-3.5",
-			"model": "gpt-3.5",
+			"name": "gpt-3.5:latest",
+			"model": "gpt-3.5:latest",
 			"modified_at": "2069-01-01T00:00:00Z",
 			"size": 69,
 			"digest": "yesiputfunnynumberabove",
@@ -767,8 +1228,8 @@ func hTags(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 		{
-			"name": "tts",
-			"model": "tts",
+			"name": "tts:latest",
+			"model": "tts:latest",
 			"modified_at": "2069-01-01T00:00:00Z",
 			"size": 69,
 			"digest": "yesiputfunnynumberabove",
@@ -782,8 +1243,8 @@ func hTags(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 		{
-			"name": "base64",
-			"model": "base64",
+			"name": "base64:latest",
+			"model": "base64:latest",
 			"modified_at": "2069-01-01T00:00:00Z",
 			"size": 69,
 			"digest": "yesiputfunnynumberabove",
@@ -797,8 +1258,8 @@ func hTags(w http.ResponseWriter, r *http.Request) {
 			}
 		},
 		{
-			"name": "dall-e-3",
-			"model": "dall-e-3",
+			"name": "dall-e-3:latest",
+			"model": "dall-e-3:latest",
 			"modified_at": "2069-01-01T00:00:00Z",
 			"size": 69,
 			"digest": "yesiputfunnynumberabove",
@@ -856,7 +1317,48 @@ func SplitW(s string) []string {
 	return result
 }
 
-// same rfc timestamp as ollama
+// basically just trims the tip of the message down if it's too long xd (apart of dementia mode)
+func circumsizeM(messages []msg, maxLength int) []msg {
+	if len(messages) == 0 {
+		return messages
+	}
+	totalLength := 0
+	for _, m := range messages {
+		totalLength += len(m.Content)
+	}
+	if totalLength <= maxLength {
+		return messages
+	}
+	circumsized := make([]msg, 0, len(messages))
+	systemMessages := make([]msg, 0)
+	for _, m := range messages {
+		if m.Role == "system" {
+			systemMessages = append(systemMessages, m)
+		}
+	}
+
+	currentLength := 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "system" {
+			continue // Skip important instructions cuz u don't want it being clueless on how to behave
+		}
+
+		if currentLength+len(messages[i].Content) <= maxLength {
+			circumsized = append([]msg{messages[i]}, circumsized...)
+			currentLength += len(messages[i].Content)
+		} else {
+			break
+		}
+	}
+
+	result := append(systemMessages, circumsized...)
+	if debug {
+		fmt.Printf("[DEBUG] Prompt circumsized from %d to %d characters\n", totalLength, currentLength)
+	}
+
+	return result
+}
+
 func nowRFC() string {
 	return time.Now().UTC().Format("2006-01-02T15:04:05.0000000Z")
 }
