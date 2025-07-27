@@ -253,9 +253,21 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 			Content: generateReq.Prompt,
 		})
 	} else {
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		// added the system ability so u can declare a personallity or roleplay for the sick freaks of you out there
+		var raw map[string]interface{}
+		if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
+		}
+		b, _ := json.Marshal(raw)
+		if err := json.Unmarshal(b, &req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if sys, ok := raw["system"]; ok {
+			if sysStr, ok := sys.(string); ok && sysStr != "" {
+				req.Messages = append([]msg{{Role: "system", Content: sysStr}}, req.Messages...)
+			}
 		}
 	}
 	model := req.Model
