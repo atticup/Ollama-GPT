@@ -31,6 +31,13 @@ var streamOverride *bool
 // HTTP client (shared) just makes requests faster
 var sharedHTTPClient = &http.Client{
 	Timeout: 60 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+		DisableCompression:  false,
+		ForceAttemptHTTP2:   true,
+	},
 }
 
 // ollamaReq is the request format for ollama
@@ -88,6 +95,28 @@ type ollamaGenerateResp struct {
 	EvalDuration       int64  `json:"eval_duration,omitempty"`
 }
 
+func preWarmConnection() {
+	if debug {
+		fmt.Println("[DEBUG] prewarming connection to pfuner.xyz (just makes messages a bit faster)")
+	}
+	helloReq := chatReq{
+		Messages: []string{"hello world"},
+	}
+	reqBody, _ := json.Marshal(helloReq)
+	resp, err := sharedHTTPClient.Post("https://pfuner.xyz/v1/chat/completions", "application/json", bytes.NewBuffer(reqBody))
+	if err != nil {
+		if debug {
+			fmt.Printf("[DEBUG] prewarmup failed (this is normal just ignore and continue) %v\n", err)
+		}
+		return
+	}
+	defer resp.Body.Close()
+
+	if debug {
+		fmt.Println("[DEBUG] prewarmup successful connection is ready have fun")
+	}
+}
+
 // main function (starts the server)
 func main() {
 	var input string
@@ -116,6 +145,9 @@ func main() {
 		streamOverride = nil
 		fmt.Println("\nno input in 10s defaulting to ask (basically the service decides) mode.")
 	}
+
+	// Pre-warm the connection in the background
+	go preWarmConnection()
 	http.HandleFunc("/api/chat", hChat)
 	http.HandleFunc("/api/generate", hChat)
 	http.HandleFunc("/api/tags", hTags)
