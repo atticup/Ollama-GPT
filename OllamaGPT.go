@@ -105,6 +105,15 @@ func main() {
 	http.HandleFunc("/api/generate", hChat)
 	http.HandleFunc("/api/tags", hTags)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+
 		w.Header().Set("Content-Type", "text/plain")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("Ollama is running")) //spoofs the fact that ollama is running cuz some services relay on it
@@ -470,6 +479,16 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 
 // spoofs which models are available allowing services to see all your options.
 func hTags(w http.ResponseWriter, r *http.Request) {
+	// Add CORS headers for tags endpoint
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(`{
