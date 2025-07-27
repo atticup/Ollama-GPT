@@ -984,7 +984,8 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("\n"))
 		return
 	}
-	if model == "dall-e-3" {
+	// Use baseModel for translation logic
+	if baseModel == "dall-e-3" {
 		var imgResp struct {
 			Created int64 `json:"created"`
 			Data    []struct {
@@ -1036,7 +1037,7 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return
 	}
-	if model == "base64" {
+	if baseModel == "base64" {
 		var base64Resp struct {
 			Output [][]string `json:"output"`
 			Ms     int64      `json:"ms"`
@@ -1084,7 +1085,7 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		flusher.Flush()
 		return
 	}
-	if model == "tts" {
+	if baseModel == "tts" {
 		var ttsResp struct {
 			URL string `json:"url"`
 		}
