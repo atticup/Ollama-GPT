@@ -58,11 +58,26 @@ type chatResp struct {
 	Ms    int64  `json:"ms"`
 }
 
-// ollamaResp is the response format for ollama
+// ollamaResp is the response format for ollama (chat only yes i made /api/generate actually work yippe)
 type ollamaResp struct {
 	Model              string `json:"model"`
 	CreatedAt          string `json:"created_at"`
 	Message            msg    `json:"message"`
+	DoneReason         string `json:"done_reason,omitempty"`
+	Done               bool   `json:"done"`
+	TotalDuration      int64  `json:"total_duration,omitempty"`
+	LoadDuration       int64  `json:"load_duration,omitempty"`
+	PromptEvalCount    int    `json:"prompt_eval_count,omitempty"`
+	PromptEvalDuration int64  `json:"prompt_eval_duration,omitempty"`
+	EvalCount          int    `json:"eval_count,omitempty"`
+	EvalDuration       int64  `json:"eval_duration,omitempty"`
+}
+
+// ollamaGenerateResp is the response format for ollama generate (api/generate)
+type ollamaGenerateResp struct {
+	Model              string `json:"model"`
+	CreatedAt          string `json:"created_at"`
+	Response           string `json:"response"`
 	DoneReason         string `json:"done_reason,omitempty"`
 	Done               bool   `json:"done"`
 	TotalDuration      int64  `json:"total_duration,omitempty"`
@@ -141,10 +156,43 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	isGenerateRequest := r.URL.Path == "/api/generate"
+
 	var req ollamaReq
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
-		return
+	//same thing as chat except entirely different
+	if isGenerateRequest {
+		var generateReq struct {
+			Model   string      `json:"model"`
+			Prompt  string      `json:"prompt"`
+			System  string      `json:"system,omitempty"`
+			Stream  bool        `json:"stream,omitempty"`
+			Options interface{} `json:"options,omitempty"`
+		}
+
+		if err := json.NewDecoder(r.Body).Decode(&generateReq); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+
+		req.Model = generateReq.Model
+		req.Stream = generateReq.Stream
+		req.Options = generateReq.Options
+		if generateReq.System != "" {
+			req.Messages = append(req.Messages, msg{
+				Role:    "system",
+				Content: generateReq.System,
+			})
+		}
+		req.Messages = append(req.Messages, msg{
+			Role:    "user",
+			Content: generateReq.Prompt,
+		})
+	} else {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
 	}
 	model := req.Model
 	var endpoint string
@@ -238,20 +286,34 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "[ERROR] reading response...", http.StatusInternalServerError)
 		return
 	}
+	//added support for x-ndjson + fixed some problems with the /api/generate ratelimit errors
 	if resp.StatusCode == 429 || strings.Contains(string(body), "\"Too many requests (\"") {
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
-		ollamaErrResp := ollamaResp{
-			Model:     model,
-			CreatedAt: nowRFC(),
-			Message: msg{
-				Role:    "assistant",
-				Content: "Too many requests please wait a min... (contact atticus if you think higher request limits should be set)",
-			},
-			DoneReason: "stop",
-			Done:       true,
+
+		var respBytes []byte
+		if isGenerateRequest {
+			ollamaErrResp := ollamaGenerateResp{
+				Model:      model,
+				CreatedAt:  nowRFC(),
+				Response:   "Too many requests please wait a min... (contact atticus if you think higher request limits should be set)",
+				DoneReason: "stop",
+				Done:       true,
+			}
+			respBytes, _ = json.Marshal(ollamaErrResp)
+		} else {
+			ollamaErrResp := ollamaResp{
+				Model:     model,
+				CreatedAt: nowRFC(),
+				Message: msg{
+					Role:    "assistant",
+					Content: "Too many requests please wait a min... (contact atticus if you think higher request limits should be set)",
+				},
+				DoneReason: "stop",
+				Done:       true,
+			}
+			respBytes, _ = json.Marshal(ollamaErrResp)
 		}
-		respBytes, _ := json.Marshal(ollamaErrResp)
 		w.Write(respBytes)
 		w.Write([]byte("\n"))
 		return
@@ -284,15 +346,27 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		stream := req.Stream
 		if streamOverride != nil {
 			stream = *streamOverride
+		} else {
+			// fixed issues in some services by setting stream to on unless said otherwise by the service in ask mode
+			stream = true
 		}
 		if stream {
-			w.Header().Set("Content-Type", "application/x-ndjson")
+			// actually proper x-ndjson (and no i don't have an idea on why half of this is a requirement but without it shit just turned into base64😭)
+			w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
+			w.Header().Set("Pragma", "no-cache")
+			w.Header().Set("Expires", "0")
+			w.Header().Set("Connection", "keep-alive")
+			w.Header().Set("Transfer-Encoding", "chunked")
+			w.Header().Set("X-Accel-Buffering", "no")
+			w.Header().Set("Access-Control-Expose-Headers", "Content-Type")
 			w.WriteHeader(http.StatusOK)
 			// Remove all U+000A (Line Feed) characters from reply
 			reply = strings.ReplaceAll(reply, "\n", "")
 			cleaned := make([]rune, 0, len(reply))
 			for _, r := range reply {
-				if r == 0x20 || (r >= 0x21 && r <= 0x7E) {
+				// changed a bit to support new x-ndjson working properly
+				if (r >= 0x20 && r <= 0x7E) || r == 0x09 || (r >= 0x80) {
 					cleaned = append(cleaned, r)
 				}
 			}
@@ -302,65 +376,106 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, "unsupported stream...", http.StatusInternalServerError)
 				return
 			}
-			words := strings.Fields(reply)
-			pos := 0
-			for _, word := range words {
-				start := strings.Index(reply[pos:], word)
-				if start == -1 {
-					continue
+			// Stream shit in chunks to be faster and require less jsons (probably foreshadowing but might cause some problems in future)
+			chunkSize := 10
+			for i := 0; i < len(reply); i += chunkSize {
+				end := i + chunkSize
+				if end > len(reply) {
+					end = len(reply)
 				}
-				start += pos
-				chunk := word
-				if start > 0 && reply[start-1] == ' ' {
-					chunk = " " + word
+				chunk := reply[i:end]
+
+				var respBytes []byte
+				if isGenerateRequest {
+					generateResp := ollamaGenerateResp{
+						Model:     model,
+						CreatedAt: createdAt,
+						Response:  chunk,
+						Done:      false,
+					}
+					respBytes, _ = json.Marshal(generateResp)
+				} else {
+					chatResp := ollamaResp{
+						Model:     model,
+						CreatedAt: createdAt,
+						Message: msg{
+							Role:    "assistant",
+							Content: chunk,
+						},
+						Done: false,
+					}
+					respBytes, _ = json.Marshal(chatResp)
 				}
-				pos = start + len(word)
-				uhhobjofollamaResp := ollamaResp{
-					Model:     model,
-					CreatedAt: createdAt,
-					Message: msg{
-						Role:    "assistant",
-						Content: chunk,
-					},
-					Done: false,
-				}
-				respBytes, _ := json.Marshal(uhhobjofollamaResp)
+
+				// Ensure proper JSON line separation with explicit newline
 				w.Write(respBytes)
 				w.Write([]byte("\n"))
 				flusher.Flush()
+				time.Sleep(10 * time.Millisecond) //yes it's pretty much required for some web services which are slow in the brain
 			}
 			// spoofs final metadata that is present in ollama WHY idk but some services need it so...
-			finalResp := ollamaResp{
-				Model:              model,
-				CreatedAt:          createdAt,
-				Message:            msg{Role: "assistant", Content: ""},
-				DoneReason:         "stop",
-				Done:               true,
-				TotalDuration:      4768114600, // Example values, replace with real timing if needed
-				LoadDuration:       2497832600,
-				PromptEvalCount:    84,
-				PromptEvalDuration: 491959200,
-				EvalCount:          37,
-				EvalDuration:       1746310500,
+			var finalrespbytes []byte
+			//modified a bit to work with /api/generate
+			if isGenerateRequest {
+				finalResp := ollamaGenerateResp{
+					Model:              model,
+					CreatedAt:          createdAt,
+					Response:           "",
+					DoneReason:         "stop",
+					Done:               true,
+					TotalDuration:      4768114600, // Example values, replace with real timing if needed (probably not required)
+					LoadDuration:       2497832600,
+					PromptEvalCount:    84,
+					PromptEvalDuration: 491959200,
+					EvalCount:          37,
+					EvalDuration:       1746310500,
+				}
+				finalrespbytes, _ = json.Marshal(finalResp)
+			} else {
+				finalResp := ollamaResp{
+					Model:              model,
+					CreatedAt:          createdAt,
+					Message:            msg{Role: "assistant", Content: ""},
+					DoneReason:         "stop",
+					Done:               true,
+					TotalDuration:      4768114600, // Example values, replace with real timing if needed (probably not required)
+					LoadDuration:       2497832600,
+					PromptEvalCount:    84,
+					PromptEvalDuration: 491959200,
+					EvalCount:          37,
+					EvalDuration:       1746310500,
+				}
+				finalrespbytes, _ = json.Marshal(finalResp)
 			}
-			respBytes, _ := json.Marshal(finalResp)
-			w.Write(respBytes)
+			w.Write(finalrespbytes)
 			w.Write([]byte("\n"))
 			flusher.Flush()
 			return
 		}
-		// sends a single json respsone incase of nonstream mode
-		uhhobjofollamaResp := ollamaResp{
-			Model:     model,
-			CreatedAt: createdAt,
-			Message: msg{
-				Role:    "assistant",
-				Content: reply,
-			},
-			DoneReason: "stop",
-			Done:       true,
+		// single json for nostream /api/generate
+		var respBytes []byte
+		if isGenerateRequest {
+			generateResp := ollamaGenerateResp{
+				Model:      model,
+				CreatedAt:  createdAt,
+				Response:   reply,
+				DoneReason: "stop",
+				Done:       true,
+			}
+			respBytes, _ = json.Marshal(generateResp)
+		} else {
+			chatResp := ollamaResp{
+				Model:     model,
+				CreatedAt: createdAt,
+				Message: msg{
+					Role:    "assistant",
+					Content: reply,
+				},
+				DoneReason: "stop",
+				Done:       true,
+			}
+			respBytes, _ = json.Marshal(chatResp)
 		}
-		respBytes, _ := json.Marshal(uhhobjofollamaResp)
 		w.Write(respBytes)
 		w.Write([]byte("\n"))
 		return
@@ -378,7 +493,7 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "[ERROR] generating image (parsing the response)...", http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		flusher, ok := w.(http.Flusher)
 		if !ok {
@@ -389,17 +504,29 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		if len(imgResp.Data) > 0 {
 			imageURL = imgResp.Data[0].URL
 		}
-		uhhobjofollamaResp := ollamaResp{
-			Model:     model,
-			CreatedAt: createdAt,
-			Message: msg{
-				Role:    "assistant",
-				Content: imageURL,
-			},
-			DoneReason: "stop",
-			Done:       true,
+		var respBytes []byte
+		if isGenerateRequest {
+			generateResp := ollamaGenerateResp{
+				Model:      model,
+				CreatedAt:  createdAt,
+				Response:   imageURL,
+				DoneReason: "stop",
+				Done:       true,
+			}
+			respBytes, _ = json.Marshal(generateResp)
+		} else {
+			chatResp := ollamaResp{
+				Model:     model,
+				CreatedAt: createdAt,
+				Message: msg{
+					Role:    "assistant",
+					Content: imageURL,
+				},
+				DoneReason: "stop",
+				Done:       true,
+			}
+			respBytes, _ = json.Marshal(chatResp)
 		}
-		respBytes, _ := json.Marshal(uhhobjofollamaResp)
 		w.Write(respBytes)
 		w.Write([]byte("\n"))
 		flusher.Flush()
@@ -414,7 +541,7 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "[ERROR] generating base64...", http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		flusher, ok := w.(http.Flusher)
 		if !ok {
@@ -425,17 +552,29 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 		if len(base64Resp.Output) > 0 && len(base64Resp.Output[0]) > 0 {
 			base64str = base64Resp.Output[0][0]
 		}
-		uhhobjofollamaResp := ollamaResp{
-			Model:     model,
-			CreatedAt: createdAt,
-			Message: msg{
-				Role:    "assistant",
-				Content: base64str,
-			},
-			DoneReason: "stop",
-			Done:       true,
+		var respBytes []byte
+		if isGenerateRequest {
+			generateResp := ollamaGenerateResp{
+				Model:      model,
+				CreatedAt:  createdAt,
+				Response:   base64str,
+				DoneReason: "stop",
+				Done:       true,
+			}
+			respBytes, _ = json.Marshal(generateResp)
+		} else {
+			chatResp := ollamaResp{
+				Model:     model,
+				CreatedAt: createdAt,
+				Message: msg{
+					Role:    "assistant",
+					Content: base64str,
+				},
+				DoneReason: "stop",
+				Done:       true,
+			}
+			respBytes, _ = json.Marshal(chatResp)
 		}
-		respBytes, _ := json.Marshal(uhhobjofollamaResp)
 		w.Write(respBytes)
 		w.Write([]byte("\n"))
 		flusher.Flush()
@@ -449,30 +588,42 @@ func hChat(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "[ERROR] generating tts...", http.StatusInternalServerError)
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "unsupported stream...", http.StatusInternalServerError)
 			return
 		}
-		uhhobjofollamaResp := ollamaResp{
-			Model:     model,
-			CreatedAt: createdAt,
-			Message: msg{
-				Role:    "assistant",
-				Content: ttsResp.URL,
-			},
-			DoneReason: "stop",
-			Done:       true,
+		var respBytes []byte
+		if isGenerateRequest {
+			generateResp := ollamaGenerateResp{
+				Model:      model,
+				CreatedAt:  createdAt,
+				Response:   ttsResp.URL,
+				DoneReason: "stop",
+				Done:       true,
+			}
+			respBytes, _ = json.Marshal(generateResp)
+		} else {
+			chatResp := ollamaResp{
+				Model:     model,
+				CreatedAt: createdAt,
+				Message: msg{
+					Role:    "assistant",
+					Content: ttsResp.URL,
+				},
+				DoneReason: "stop",
+				Done:       true,
+			}
+			respBytes, _ = json.Marshal(chatResp)
 		}
-		respBytes, _ := json.Marshal(uhhobjofollamaResp)
 		w.Write(respBytes)
 		w.Write([]byte("\n"))
 		flusher.Flush()
 		return
 	}
-	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Content-Type", "application/x-ndjson; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	w.Write(body)
 }
